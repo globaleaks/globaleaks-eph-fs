@@ -1,7 +1,11 @@
 import argparse
+import atexit
 import errno
 import os
+import re
 import stat
+import sys
+import subprocess
 import uuid
 import threading
 from fuse import FUSE, FuseOSError, Operations
@@ -9,44 +13,89 @@ from tempfile import mkdtemp
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.algorithms import ChaCha20
 
+CHUNK_SIZE = 4096
+
+UUID4_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', re.IGNORECASE)
+
+def is_valid_uuid4(filename):
+    """
+    Validates if the given filename follows the UUIDv4 format.
+
+    :param filename: The name of the file.
+    :return: True if the filename is a valid UUIDv4, otherwise False.
+    """
+    return bool(UUID4_PATTERN.match(filename))
+
+def is_mount_point(path):
+    """
+    Checks if the given path is a mount point.
+
+    A mount point is a directory where a filesystem is attached. This function checks
+    if the provided path is currently being used as a mount point by querying the
+    system's mount information.
+
+    :param path: The directory path to check if it is a mount point.
+    :return: True if the given path is a mount point, otherwise False.
+    :raises Exception: If there is an error while running the 'mount' command or parsing the result.
+    """
+    result = subprocess.run(['mount'], capture_output=True, text=True)
+    return any(os.path.abspath(path) in line for line in result.stdout.splitlines())
+
+def unmount_if_mounted(path):
+    """
+    Checks if the given path is a mount point and attempts to unmount it.
+
+    :param path: The path to check and unmount if it is a mount point.
+    """
+    if is_mount_point(path):
+        subprocess.run(['fusermount', '-u', path])
+
 class EphemeralFile:
-    def __init__(self, filesdir):
+    def __init__(self, filesdir, filename=None):
         """
         Initializes an ephemeral file with ChaCha20 encryption.
         Creates a new random file path and generates a unique encryption key and nonce.
 
         :param filesdir: The directory where the ephemeral file will be stored.
+        :param filenames: Optional filename. If not provided, a UUID4 is used.
         """
-        self.fd = None
-        self.filename = str(uuid.uuid4())  # UUID as a string for the file name
-        self.filepath = os.path.join(filesdir, self.filename)
-        self.nonce = os.urandom(16)  # 128-bit nonce
-        self.key = os.urandom(32)    # 256-bit key
-        self.cipher = Cipher(ChaCha20(self.key, self.nonce), mode=None)
-        self.size = 0
-        self.position = 0
+        filename = filename or str(uuid.uuid4())  # If filenames is None, generate a random UUID as a string
+        self.filepath = os.path.join(filesdir, filename)
+        self.cipher = Cipher(ChaCha20(os.urandom(32), uuid.UUID(filename).bytes[:16]), mode=None)
         self.enc = self.cipher.encryptor()
-        self.dec = None
-        self.creation_time = os.path.getctime(self.filepath) if os.path.exists(self.filepath) else None
-        self.last_access_time = None
-        self.last_mod_time = None
-        self.mutex = threading.Lock()
+        self.dec = self.cipher.decryptor()
 
-    def open(self, mode):
+        self.fd = None
+
+    def __getattribute__(self, name):
+        """
+        Intercepts attribute access for the `EphemeralFile` class.
+
+        If the attribute being accessed is 'size', it returns the size of the file
+        by checking the file's attributes using os.stat. For all other attributes,
+        it defers to the default behavior of `__getattribute__`, allowing normal
+        attribute access.
+
+        :param name: The name of the attribute being accessed.
+        :return: The value of the requested attribute. If 'size' is requested,
+                 the size of the file is returned. Otherwise, the default
+                 behavior for attribute access is used.
+        """
+        if name == "size":
+            return os.stat(self.filepath).st_size
+
+        # For everything else, defer to the default behavior
+        return super().__getattribute__(name)
+
+    def open(self, flags, mode=0o660):
         """
         Opens the ephemeral file for reading or writing.
 
         :param mode: 'w' for writing, 'r' for reading.
         :return: The file object.
         """
-        with self.mutex:
-            if mode == 'w':
-                self.fd = os.open(self.filepath, os.O_RDWR | os.O_CREAT | os.O_APPEND)
-                self.dec = None
-            else:
-                self.fd = os.open(self.filepath, os.O_RDONLY)
-                self.dec = self.cipher.decryptor()
-            self.last_access_time = os.path.getatime(self.filepath)
+        self.fd = os.open(self.filepath, os.O_RDWR | os.O_CREAT | os.O_APPEND, mode)
+        os.chmod(self.filepath, mode)
         return self
 
     def write(self, data):
@@ -55,14 +104,7 @@ class EphemeralFile:
 
         :param data: Data to write to the file, can be a string or bytes.
         """
-        with self.mutex:
-            if isinstance(data, str):
-                data = data.encode('utf-8')
-            encrypted_data = self.enc.update(data)
-            os.write(self.fd, encrypted_data)
-            self.size += len(data)
-            self.position += len(data)
-            self.last_mod_time = os.path.getmtime(self.filepath)
+        os.write(self.fd, self.enc.update(data))
 
     def read(self, size=None):
         """
@@ -71,27 +113,22 @@ class EphemeralFile:
         :param size: The number of bytes to read. If None, reads until the end of the file.
         :return: The decrypted data read from the file.
         """
-        with self.mutex:
-            data = b""
-            bytes_read = 0
+        data = b""
+        bytes_read = 0
 
-            while True:
-                # Determine how much to read in this chunk
-                chunk_size = min(4096, size - bytes_read) if size is not None else 4096
+        while True:
+            # Determine how much to read in this chunk
+            chunk_size = min(CHUNK_SIZE, size - bytes_read) if size is not None else CHUNK_SIZE
 
-                chunk = os.read(self.fd, chunk_size)
-                if not chunk:  # End of file
-                    break
+            chunk = os.read(self.fd, chunk_size)
+            if not chunk:  # End of file
+                break
 
-                data += self.dec.update(chunk)
-                bytes_read += len(chunk)
+            data += self.dec.update(chunk)
+            bytes_read += len(chunk)
 
-                if size is not None and bytes_read >= size:
-                    break
-
-            # Update the last access time and position
-            self.last_access_time = os.path.getatime(self.filepath)
-            self.position += bytes_read  # Update position after read
+            if size is not None and bytes_read >= size:
+                break
 
         return data
 
@@ -101,34 +138,32 @@ class EphemeralFile:
 
         :param offset: The offset to seek to.
         """
-        with self.mutex:
-            if self.position != offset:
-                if offset < self.position:
-                    self.dec = self.cipher.decryptor()  # Reuse the existing cipher instance
-                    os.lseek(self.fd, 0, os.SEEK_SET)
-                    self.position = 0
-
-                discard_size = offset - self.position
-                chunk_size = 4096
-                while discard_size > 0:
-                    to_read = min(discard_size, chunk_size)
-                    self.dec.update(os.read(self.fd, to_read))  # Discard the data
-                    discard_size -= to_read
-
-            self.position = offset  # Update position after seek
+        position = 0
+        self.dec = self.cipher.decryptor()
+        self.enc = self.cipher.encryptor()
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        discard_size = offset - position
+        while discard_size > 0:
+            to_read = min(CHUNK_SIZE, discard_size)
+            data = self.dec.update(os.read(self.fd, to_read))
+            data = self.enc.update(data)
+            discard_size -= to_read
 
     def tell(self):
-        with self.mutex:
-            return self.position
+        """
+        Returns the current position in the file.
+
+        :return: The current position in the file.
+        """
+        return os.lseek(self.fd, 0, os.SEEK_CUR)
 
     def close(self):
         """
         Closes the file descriptor.
         """
-        with self.mutex:
-            if self.fd is not None:
-                os.close(self.fd)
-                self.fd = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
     def __enter__(self):
         """
@@ -148,25 +183,27 @@ class EphemeralFile:
         """
         self.close()
         try:
-            os.remove(self.filepath)
+            os.unlink(self.filepath)
         except FileNotFoundError:
             pass
 
 class EphemeralOperations(Operations):
+    use_ns = True
     def __init__(self, storage_directory=None):
         """
         Initializes the operations for the ephemeral filesystem.
 
         :param storage_directory: The directory to store the files. Defaults to a temporary directory.
         """
-        if storage_directory is None:
-            storage_directory = mkdtemp()
-        self.storage_directory = storage_directory
+        self.storage_directory = storage_directory if storage_directory is not None else mkdtemp()
         self.files = {}  # Track open files and their secure temporary file handlers
-        self.default_permissions = 0o660  # Default permissions for files (user read/write)
-        self.uid = os.getuid()  # Current user's UID
-        self.gid = os.getgid()  # Current user's GID
         self.mutex = threading.Lock()
+
+    def get_file(self, path):
+        file = self.files.get(path)
+        if file is None:
+            raise FuseOSError(errno.ENOENT)
+        return file
 
     def getattr(self, path, fh=None):
         """
@@ -178,21 +215,18 @@ class EphemeralOperations(Operations):
         """
         with self.mutex:
             if path == '/':
-                st = {'st_mode': (stat.S_IFDIR | 0o750), 'st_nlink': 2}
-            else:
-                file = self.files.get(path)
-                if file is None or not os.path.exists(file.filepath):
-                    raise OSError(errno.ENOENT, "No such file or directory", path)
-                st = {
-                    'st_mode': (stat.S_IFREG | 0o660),
-                    'st_size': file.size,
-                    'st_nlink': 1,
-                    'st_uid': self.uid,
-                    'st_gid': self.gid,
-                    'st_atime': file.last_access_time if file.last_access_time else os.path.getatime(file.filepath),
-                    'st_mtime': file.last_mod_time if file.last_mod_time else os.path.getmtime(file.filepath),
-                    'st_ctime': file.creation_time if file.creation_time else os.path.getctime(file.filepath),
-                }
+                return {'st_mode': (stat.S_IFDIR | 0o750), 'st_nlink': 2}
+
+            file = self.get_file(path)
+
+            file_stat = os.stat(file.filepath)
+
+            st = {key: getattr(file_stat, key) for key in dir(file_stat) if not key.startswith('__')}
+
+            st['st_mode'] |= stat.S_IFDIR if stat.S_ISDIR(file_stat.st_mode) else 0
+            st['st_mode'] |= stat.S_IFREG if stat.S_ISREG(file_stat.st_mode) else 0
+            st['st_mode'] |= stat.S_IFLNK if stat.S_ISLNK(file_stat.st_mode) else 0
+
             return st
 
     def readdir(self, path, fh=None):
@@ -214,11 +248,13 @@ class EphemeralOperations(Operations):
         :param mode: The mode in which the file will be opened.
         :return: The file descriptor.
         """
+        filename = os.path.basename(path)
+        if not is_valid_uuid4(filename):
+            raise FuseOSError(errno.ENOENT)
+
         with self.mutex:
-            file = EphemeralFile(self.storage_directory)
-            file.open('w')
-            os.chmod(file.filepath, self.default_permissions)
-            os.chown(file.filepath, self.uid, self.gid)
+            file = EphemeralFile(self.storage_directory, filename)
+            file.open('w', mode)
             self.files[path] = file
             return file.fd
 
@@ -231,11 +267,8 @@ class EphemeralOperations(Operations):
         :return: The file descriptor.
         """
         with self.mutex:
-            file = self.files.get(path)
-            if path not in self.files:
-                raise FuseOSError(errno.ENOENT)
-            mode = 'w' if (flags & os.O_RDWR or flags & os.O_WRONLY) else 'r'
-            file.open(mode)
+            file = self.get_file(path)
+            file.open('w' if (flags & os.O_RDWR or flags & os.O_WRONLY) else 'r')
             return file.fd
 
     def read(self, path, size, offset, fh=None):
@@ -249,9 +282,7 @@ class EphemeralOperations(Operations):
         :return: The data read from the file.
         """
         with self.mutex:
-            file = self.files.get(path)
-            if file is None:
-                raise FuseOSError(errno.ENOENT)
+            file = self.get_file(path)
             file.seek(offset)
             return file.read(size)
 
@@ -266,7 +297,7 @@ class EphemeralOperations(Operations):
         :return: The number of bytes written.
         """
         with self.mutex:
-            file = self.files.get(path)
+            file = self.get_file(path)
             file.write(data)
             return len(data)
 
@@ -280,7 +311,7 @@ class EphemeralOperations(Operations):
             file = self.files.pop(path, None)
             if file:
                 file.close()
-                os.remove(file.filepath)
+                os.unlink(file.filepath)
 
     def release(self, path, fh=None):
         """
@@ -290,9 +321,7 @@ class EphemeralOperations(Operations):
         :param fh: File handle (not used here).
         """
         with self.mutex:
-            file = self.files.get(path)
-            if file:
-                file.close()
+            self.get_file(path).close()
 
     def truncate(self, path, length, fh=None):
         """
@@ -305,70 +334,68 @@ class EphemeralOperations(Operations):
         :param length: The new size of the file.
         """
         with self.mutex:
-            original_file = self.files.get(path)
-            if original_file is None:
-                raise FuseOSError(errno.ENOENT)
+            file = self.get_file(path)
 
-            if length < original_file.size:
-                original_file.open('r')
+            if length < file.size:
+                os.truncate(file.filepath, length)
 
-                truncated_file = EphemeralFile(self.storage_directory)
-                truncated_file.open('w')
-                os.chmod(truncated_file.filepath, self.default_permissions)
-                os.chown(truncated_file.filepath, self.uid, self.gid)
+            file.seek(length)
 
-                truncated_file.open('w')
-
+            if length > file.size:
+                length = length - file.size
                 bytes_written = 0
-                chunk_size = 4096
                 while bytes_written < length:
-                    remaining = length - bytes_written
-                    to_read = min(chunk_size, remaining)
-                    truncated_file.write(original_file.read(to_read))
-                    bytes_written += to_read
-
-                del original_file
-                self.files[path] = truncated_file
-            elif length > original_file.size:
-                length = length - original_file.size
-                original_file.open('w')
-                bytes_written = 0
-                chunk_size = 4096
-                while bytes_written < length:
-                    remaining = length - bytes_written
-                    to_write = min(chunk_size, remaining)
-                    original_file.write(b'\0' * to_write)
+                    to_write = min(CHUNK_SIZE, length - bytes_written)
+                    file.write(b'\0' * to_write)
                     bytes_written += to_write
 
-class EphemeralFS(FUSE):
-    """
-    A class that mounts an ephemeral filesystem at the given mount point.
-    Inherits from FUSE to provide the filesystem mounting functionality.
-
-    Args:
-        mount_point (str): The path where the filesystem will be mounted.
-        storage_directory (str, optional): The directory used for storage. If None, uses a temporary directory.
-        **fuse_args: Additional arguments to pass to the FUSE constructor.
-    """
-    def __init__(self, mount_point, storage_directory=None, **fuse_args):
+    def chmod(self, path, mode):
         """
-        Initializes and mounts the ephemeral filesystem.
+        Changes the permissions of the file at the specified path.
 
-        :param mount_point: The path where the filesystem will be mounted.
-        :param storage_directory: The directory to store the files (optional).
+        :param path: The file path whose permissions will be changed.
+        :param mode: The new permissions mode (e.g., 0o777 for full permissions).
+        :raises FuseOSError: If the file does not exist.
         """
-        self.mount_point = mount_point
-        self.storage_directory = storage_directory
+        file = self.get_file(path)
+        return os.chmod(file.filepath, mode)
 
+    def chown(self, path, uid, gid):
+        """
+        Changes the ownership of the file at the specified path.
+
+        :param path: The file path whose ownership will be changed.
+        :param uid: The user ID (uid) to set as the new owner.
+        :param gid: The group ID (gid) to set as the new group owner.
+        :raises FuseOSError: If the file does not exist.
+        """
+        file = self.get_file(path)
+        return os.chown(file.filepath, uid, gid)
+
+def mount_globaleaks_eph_fs(mount_point, storage_directory=None, foreground=False):
+    """
+    Initializes and mounts the ephemeral filesystem.
+
+    :param mount_point: The path where the filesystem will be mounted.
+    :param storage_directory: The directory to store the files (optional).
+    :return: A `FUSE` object that represents the mounted filesystem.
+    """
+    def _mount_globaleaks_eph_fs(mount_point, storage_directory=None, foreground=False):
         # Create the mount point directory if it does not exist
-        os.makedirs(self.mount_point, exist_ok=True)
+        os.makedirs(mount_point, exist_ok=True)
 
         # If a storage directory is specified, create it as well
-        if self.storage_directory:
-            os.makedirs(self.storage_directory, exist_ok=True)
+        if storage_directory:
+            os.makedirs(storage_directory, exist_ok=True)
 
-        # Initialize the FUSE mount with the EphemeralFS
-        super().__init__(EphemeralOperations(self.storage_directory), self.mount_point, **fuse_args)
+        return FUSE(EphemeralOperations(storage_directory), mount_point, foreground=foreground)
+
+    thread = threading.Thread(target=_mount_globaleaks_eph_fs, args=(mount_point, storage_directory, foreground))
+    thread.start()
+
+    atexit.register(unmount_if_mounted, mount_point)
+
+    return thread
 
 def main():
     """
@@ -378,7 +405,14 @@ def main():
     parser.add_argument('mount_point', help="Path to mount the filesystem")
     parser.add_argument('--storage_directory', '-s', help="Optional storage directory. Defaults to a temporary directory.")
     args = parser.parse_args()
-    EphemeralFS(args.mount_point, args.storage_directory, foreground=True)
 
-if __name__ == '__main__':
-    main()
+    unmount_if_mounted(args.mount_point)
+
+    try:
+       print(f"Mounting GLOBALEAKS EPH FS at {args.mount_point}")
+       mount_globaleaks_eph_fs(args.mount_point, args.storage_directory, True).join()
+
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except:
+        sys.exit(1)

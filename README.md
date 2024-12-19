@@ -21,43 +21,30 @@ pip install globaleaks-eph-fs
 To mount the filesystem from the command line:
 
 ```bash
-globaleaks-eph-fs <mountpoint> [--storage_directory <directory>]
+globaleaks-eph-fs [--storage_directory <directory>] <mountpoint>
 ```
 
+- `--storage_directory STORAGE_DIRECTORY` (optional): The directory used for storage. If not provided, a temporary directory will be used.
 - `<mountpoint>`: The path where the filesystem will be mounted.
-- `--storage_directory` (optional): The directory used for storage. If not provided, a temporary directory will be used.
 
 ### Python API
 
 You can also use `globaleaks-eph-fs` within your Python code. Here's an example:
 
 ```python
-import argparse
-from globaleaks_eph_fs import EphemeralFS
+from globaleaks_eph_fs import mount_globaleaks_eph_fs
 
-def main():
-    parser = argparse.ArgumentParser(description="GLOBALEAKS EPHEMERAL FS")
-    parser.add_argument('mount_point', help="Path to mount the filesystem")
-    parser.add_argument('--storage_directory', '-s', help="Optional storage directory. Defaults to a temporary directory.")
-    args = parser.parse_args()
+eph_fs_thread = mount_globaleaks_eph_fs("/mnt/globaleaks-eph-fs")
 
-    EphemeralFS(args.mount_point, args.storage_directory, nothreads=True, foreground=True)
-
-
-if __name__ == '__main__':
-    main()
+eph_fs_thread.join()
 ```
-
-### Arguments
-
-- `mount_point` (required): The directory where the encrypted filesystem will be mounted.
-- `--storage_directory` (optional): Specify a custom storage directory for the filesystem. If not provided, a temporary directory will be used.
 
 ## Features
 
 - **ChaCha20 Encryption**: All data stored in the filesystem is encrypted with ChaCha20.
 - **FUSE Integration**: Mount the filesystem as a virtual disk using FUSE.
 - **Temporary Storage**: The filesystem is ephemeral and can use a temporary directory for storage.
+- **Metadata Free**: The filesystem preserves only files content enforcing random uuid4 files' names.
 
 ## Requirements
 
