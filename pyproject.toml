@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "globaleaks_eph_fs"
-version = "0.0.2"
+version = "0.0.3"
 authors = [
   { name="Giovanni Pellerano", email="giovanni.pellerano@globaleaks.org" },
 ]

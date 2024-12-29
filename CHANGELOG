@@ -1,3 +1,7 @@
+Changes in version 0.0.3
+    Revise packaging and raise tests' code coverage to 100%
+    Add threat model draft
+
 Changes in version 0.0.2
     Revise implementation to enable random access
 
