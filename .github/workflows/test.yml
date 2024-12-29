@@ -31,7 +31,7 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          coverage run -m unittest discover -s tests
+          coverage run -m unittest discover
           coverage xml  # Generates the XML report for Codacy
 
       - name: Upload coverage to Codacy
