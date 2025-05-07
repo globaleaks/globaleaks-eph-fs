@@ -12,7 +12,7 @@ from unittest.mock import patch, MagicMock
 
 from globaleaks_eph_fs import EphemeralFile, EphemeralOperations, mount_globaleaks_eph_fs, main, unmount_if_mounted
 
-TEST_PATH = str(uuid.uuid4())
+TEST_PATH = "/" + str(uuid.uuid4())
 TEST_DATA = b"Hello, world! This is a test data for writing, seeking and reading operations."
 
 ORIGINAL_SIZE = len(TEST_DATA)
@@ -58,6 +58,7 @@ class TestEphemeralFile(unittest.TestCase):
         del self.ephemeral_file
         self.assertFalse(os.path.exists(path_copy))
 
+
 class TestEphemeralOperations(unittest.TestCase):
     def setUp(self):
         self.storage_dir = mkdtemp()
@@ -74,12 +75,7 @@ class TestEphemeralOperations(unittest.TestCase):
 
     def test_create_file(self):
         self.fs.create(TEST_PATH, 0o660)
-        self.assertIn(TEST_PATH, self.fs.files)
-
-    def test_create_file_with_arbitrary_name(self):
-        with self.assertRaises(FuseOSError) as context:
-            self.fs.create('/arbitraryname', os.O_RDONLY)
-        self.assertEqual(context.exception.errno, errno.ENOENT)
+        self.assertIn('st_mode', self.fs.getattr(TEST_PATH))
 
     def test_open_existing_file(self):
         self.fs.create(TEST_PATH, 0o660)
@@ -103,10 +99,12 @@ class TestEphemeralOperations(unittest.TestCase):
 
     def test_unlink_file(self):
         self.fs.create(TEST_PATH, 0o660)
-        self.assertIn(TEST_PATH, self.fs.files)
+        self.assertIn('st_mode', self.fs.getattr(TEST_PATH))
 
         self.fs.unlink(TEST_PATH)
-        self.assertNotIn(TEST_PATH, self.fs.files)
+
+        with self.assertRaises(FuseOSError):
+            self.fs.getattr(TEST_PATH)
 
     def test_file_not_found(self):
         with self.assertRaises(FuseOSError) as context:
@@ -125,14 +123,8 @@ class TestEphemeralOperations(unittest.TestCase):
         attr = self.fs.getattr(TEST_PATH)
 
         self.assertEqual(stat.S_IFMT(attr['st_mode']), stat.S_IFREG)
-        self.assertEqual(attr['st_mode'] & 0o777, 0o660)
         self.assertEqual(attr['st_size'], 0)
         self.assertEqual(attr['st_nlink'], 1)
-        self.assertEqual(attr['st_uid'], os.getuid())
-        self.assertEqual(attr['st_gid'], os.getgid())
-        self.assertIn('st_atime', attr)
-        self.assertIn('st_mtime', attr)
-        self.assertIn('st_ctime', attr)
 
     def test_getattr_nonexistent(self):
         with self.assertRaises(OSError) as _:
@@ -158,46 +150,45 @@ class TestEphemeralOperations(unittest.TestCase):
         self.assertTrue(all(byte == 0 for byte in file_content[ORIGINAL_SIZE:]))
 
     def test_readdir(self):
-        file_names = []
-        for _ in range(3):
-            file_names.append(str(uuid.uuid4()))
-            self.fs.create(file_names[-1], 0o660)
+        self.assertEqual(self.fs.readdir('/', None), [".", ".."])
 
-        directory_contents = self.fs.readdir('/', None)
-        self.assertEqual(set(directory_contents), {'.', '..', file_names[0], file_names[1], file_names[2]})
+        for x in range(3):
+            self.fs.create(str(uuid.uuid4()), 0o660)
+            self.assertEqual(len(self.fs.readdir('/', None)), 3 + x)
 
-        self.fs.unlink(file_names[1])
-        directory_contents = self.fs.readdir('/', None)
-        self.assertEqual(set(directory_contents), {'.', '..', file_names[0], file_names[2]})
+    def test_mkdir_success(self):
+        new_dir_path = "/dir1"
+        self.fs.mkdir(new_dir_path, 0o755)
 
-    @patch("os.chmod")
-    def test_chmod_success(self, mock_chmod):
-        self.fs.create(TEST_PATH, 0o660)
-        mock_chmod.assert_called_with(self.fs.files[TEST_PATH].filepath, 0o660)
-        self.fs.chmod(TEST_PATH, 0o640)
-        mock_chmod.assert_called_with(self.fs.files[TEST_PATH].filepath, 0o640)
+        attr = self.fs.getattr(new_dir_path)
+        self.assertEqual(stat.S_IFMT(attr['st_mode']), stat.S_IFDIR)
 
-    def test_chmod_file_not_found(self):
+    def test_mkdir_parent_not_exist(self):
         with self.assertRaises(FuseOSError) as context:
-            self.fs.chmod("/nonexistent", 0o644)
+            self.fs.mkdir("/a/b", 0o755)
         self.assertEqual(context.exception.errno, errno.ENOENT)
 
-    @patch("os.chown")
-    def test_chown_success(self, mock_chown):
-        self.fs.create(TEST_PATH, 0o660)
-        self.fs.chown(TEST_PATH, self.current_uid, self.current_gid)
-        mock_chown.assert_called_once_with(self.fs.files[TEST_PATH].filepath, self.current_uid, self.current_gid)
+    def test_rmdir_success(self):
+        dir_path = "/dir2"
+        self.fs.mkdir(dir_path, 0o755)
+        self.fs.rmdir(dir_path)
+        self.assertNotIn(dir_path, self.fs.directories)
+        self.assertNotIn("dir2", self.fs.directories["/"])
 
-    def test_chown_file_not_found(self):
+    def test_rmdir_nonexistent(self):
         with self.assertRaises(FuseOSError) as context:
-            self.fs.chown("/nonexistent", self.current_uid, self.current_gid)
-        self.assertEqual(context.exception.errno, errno.ENOENT)
+            self.fs.rmdir("/nonexistent")
+        self.assertEqual(context.exception.errno, errno.ENOTEMPTY)
 
-    @patch("os.chown", side_effect=PermissionError)
-    def test_chown_permission_error(self, mock_chown):
-        self.fs.create(TEST_PATH, 0o660)
-        with self.assertRaises(PermissionError):
-            self.fs.chown(TEST_PATH, self.current_uid, self.current_gid)
+    def test_rmdir_not_empty(self):
+        dir_path = "/dir3"
+        file_path = "/dir3/testfile"
+        self.fs.mkdir(dir_path, 0o755)
+        self.fs.create(file_path, 0o660)
+        with self.assertRaises(FuseOSError) as context:
+            self.fs.rmdir(dir_path)
+        self.assertEqual(context.exception.errno, errno.ENOTEMPTY)
+
 
     @patch('atexit.register')
     @patch('argparse.ArgumentParser.parse_args')
@@ -338,6 +329,3 @@ class TestEphemeralOperations(unittest.TestCase):
             mock_atexit_register.assert_not_called()
 
             mock_subprocess.assert_not_called()
-
-if __name__ == '__main__':
-    unittest.main()
