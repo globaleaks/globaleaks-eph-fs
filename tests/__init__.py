@@ -1,8 +1,10 @@
 import errno
 import os
+import secrets
 import shutil
 import stat
 import tempfile
+import threading
 import unittest
 import uuid
 
@@ -189,6 +191,36 @@ class TestEphemeralOperations(unittest.TestCase):
             self.fs.rmdir(dir_path)
         self.assertEqual(context.exception.errno, errno.ENOTEMPTY)
 
+    def test_concurrent_access(self):
+        self.path = "/file"
+        self.fs.create(self.path, 0o660)
+        self.fs.open(self.path, os.O_RDWR)
+        self.fs.write(self.path, TEST_DATA, 0, None)
+        self.fs.release(self.path)  # finalize write
+
+        self.fs.open(self.path, os.O_RDONLY)  # reopen for read
+
+        thread_count = 100
+        barrier = threading.Barrier(thread_count)
+
+        def reader():
+            barrier.wait()
+            for _ in range(5):
+                max_offset = len(TEST_DATA) - 1
+                offset = secrets.randbelow(max_offset + 1)
+                max_length = len(TEST_DATA) - offset
+                length = 1 + secrets.randbelow(max_length)
+
+                data = self.fs.read(self.path, length, offset, None)
+                expected = TEST_DATA[offset:offset + length]
+                self.assertEqual(data, expected, f"Mismatch at offset {offset} length {length}")
+
+        threads = [threading.Thread(target=reader) for _ in range(thread_count)]
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
     @patch('atexit.register')
     @patch('argparse.ArgumentParser.parse_args')
