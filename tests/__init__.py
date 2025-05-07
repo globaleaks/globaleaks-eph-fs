@@ -158,6 +158,11 @@ class TestEphemeralOperations(unittest.TestCase):
             self.fs.create(str(uuid.uuid4()), 0o660)
             self.assertEqual(len(self.fs.readdir('/', None)), 3 + x)
 
+    def test_readdir_nonexistent_directory(self):
+        with self.assertRaises(FuseOSError) as context:
+            self.fs.readdir("/this_does_not_exist", None)
+        self.assertEqual(context.exception.errno, errno.ENOENT)
+
     def test_mkdir_success(self):
         new_dir_path = "/dir1"
         self.fs.mkdir(new_dir_path, 0o755)
