@@ -9,10 +9,28 @@ import uuid
 import threading
 from fuse import FUSE, FuseOSError, Operations
 from tempfile import gettempdir, mkdtemp
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher
 from cryptography.hazmat.primitives.ciphers.algorithms import ChaCha20
+from cryptography.hazmat.primitives.hmac import HMAC
+from cryptography.hazmat.primitives.hashes import SHA512
+
+
 
 CHUNK_SIZE = 64000
+
+
+def hmac(key, string):
+    """
+    Calculate the hmac of a filename
+
+    :param key: The key to be used to calculate the hmac
+    :param string: The string on which calculate the hmac
+    :return: The calculated hmac
+    """
+    h = HMAC(key, SHA512())
+    h.update(string.encode('utf-8'))
+    return h.finalize().hex()
 
 
 def is_mount_point(path):
@@ -195,6 +213,7 @@ class EphemeralOperations(Operations):
 
         :param storage_directory: The directory to store the files. Defaults to a temporary directory.
         """
+        self.key = os.urandom(32)
         self.storage_directory = storage_directory if storage_directory is not None else mkdtemp()
         self.files = {}  # Track open files and their secure temporary file handlers
         self.vmap_files = {}
@@ -221,7 +240,7 @@ class EphemeralOperations(Operations):
         :return: The file object stored at the given path.
         :raises FuseOSError: If the file does not exist.
         """
-        path = self.vmap_files.get(path, path)
+        path = self.vmap_files.get(hmac(self.key, path), path)
         file = self.files.get(path)
         if file is None:
             raise FuseOSError(errno.ENOENT)
@@ -305,9 +324,8 @@ class EphemeralOperations(Operations):
         :param mode: The mode in which the file will be opened.
         :return: The file descriptor.
         """
-        basedir, name = self._split_path(path)
-
         with self.mutex:
+            basedir, name = self._split_path(path)
             virtual_basedir = self.vmap_directories.get(basedir, basedir)
             file = EphemeralFile(self.storage_directory)
             file.open('w')
@@ -315,7 +333,7 @@ class EphemeralOperations(Operations):
             self.directories[virtual_basedir].add(filename)
             virtual_path = os.path.join(virtual_basedir, filename)
             self.files[virtual_path] = file
-            self.vmap_files[path] = virtual_path
+            self.vmap_files[hmac(self.key, path)] = virtual_path
             return file.fd
 
     def open(self, path, flags):
@@ -370,7 +388,7 @@ class EphemeralOperations(Operations):
         """
         with self.mutex:
             basedir, name1 = self._split_path(path)
-            path = self.vmap_files.pop(path, path)
+            path = self.vmap_files.pop(hmac(self.key, path), path)
             basedir, name2 = self._split_path(path)
             file = self.files.pop(path, None)
             if not file:
