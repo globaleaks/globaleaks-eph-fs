@@ -106,6 +106,9 @@ class TestEphemeralOperations(unittest.TestCase):
         self.fs.unlink(TEST_PATH)
 
         with self.assertRaises(FuseOSError):
+            self.fs.unlink(TEST_PATH)
+
+        with self.assertRaises(FuseOSError):
             self.fs.getattr(TEST_PATH)
 
     def test_file_not_found(self):
